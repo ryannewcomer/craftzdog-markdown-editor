@@ -1,104 +1,113 @@
-#!/usr/bin/env node
+#!/usr/bin/node
 
-import {build, createServer} from 'vite';
-import electronPath from 'electron';
-import {spawn} from 'child_process';
+const {createServer, build, createLogger} = require('vite');
+const electronPath = require('electron');
+const {spawn} = require('child_process');
 
-/** @type 'production' | 'development'' */
+/** @type 'production' | 'development' | 'test' */
 const mode = (process.env.MODE = process.env.MODE || 'development');
 
 /** @type {import('vite').LogLevel} */
-const logLevel = 'warn';
+const LOG_LEVEL = 'warn';
 
-/**
- * Setup watcher for `main` package
- * On file changed it totally re-launch electron app.
- * @param {import('vite').ViteDevServer} watchServer Renderer watch server instance.
- * Needs to set up `VITE_DEV_SERVER_URL` environment variable from {@link import('vite').ViteDevServer.resolvedUrls}
- */
-function setupMainPackageWatcher({resolvedUrls}) {
-  process.env.VITE_DEV_SERVER_URL = resolvedUrls.local[0];
-
-  /** @type {ChildProcess | null} */
-  let electronApp = null;
-
-  return build({
-    mode,
-    logLevel,
-    configFile: 'packages/main/vite.config.js',
-    build: {
-      /**
-       * Set to {} to enable rollup watcher
-       * @see https://vitejs.dev/config/build-options.html#build-watch
-       */
-      watch: {},
-    },
-    plugins: [
-      {
-        name: 'reload-app-on-main-package-change',
-        writeBundle() {
-          /** Kill electron if process already exist */
-          if (electronApp !== null) {
-            electronApp.removeListener('exit', process.exit);
-            electronApp.kill('SIGINT');
-            electronApp = null;
-          }
-
-          /** Spawn new electron process */
-          electronApp = spawn(String(electronPath), ['--inspect', '.'], {
-            stdio: 'inherit',
-          });
-
-          /** Stops the watch script when the application has been quit */
-          electronApp.addListener('exit', process.exit);
-        },
-      },
-    ],
-  });
-}
-
-/**
- * Setup watcher for `preload` package
- * On file changed it reload web page.
- * @param {import('vite').ViteDevServer} watchServer Renderer watch server instance.
- * Required to access the web socket of the page. By sending the `full-reload` command to the socket, it reloads the web page.
- */
-function setupPreloadPackageWatcher({ws}) {
-  return build({
-    mode,
-    logLevel,
-    configFile: 'packages/preload/vite.config.js',
-    build: {
-      /**
-       * Set to {} to enable rollup watcher
-       * @see https://vitejs.dev/config/build-options.html#build-watch
-       */
-      watch: {},
-    },
-    plugins: [
-      {
-        name: 'reload-page-on-preload-package-change',
-        writeBundle() {
-          ws.send({
-            type: 'full-reload',
-          });
-        },
-      },
-    ],
-  });
-}
-
-/**
- * Dev server for Renderer package
- * This must be the first,
- * because the {@link setupMainPackageWatcher} and {@link setupPreloadPackageWatcher}
- * depend on the dev server properties
- */
-const rendererWatchServer = await createServer({
+/** @type {import('vite').InlineConfig} */
+const sharedConfig = {
   mode,
-  logLevel,
-  configFile: 'packages/renderer/vite.config.js',
-}).then(s => s.listen());
+  build: {
+    watch: {},
+  },
+  logLevel: LOG_LEVEL,
+};
 
-await setupPreloadPackageWatcher(rendererWatchServer);
-await setupMainPackageWatcher(rendererWatchServer);
+/**
+ * @param configFile
+ * @param writeBundle
+ * @param name
+ * @returns {Promise<import('vite').RollupOutput | Array<import('vite').RollupOutput> | import('vite').RollupWatcher>}
+ */
+const getWatcher = ({name, configFile, writeBundle}) => {
+  return build({
+    ...sharedConfig,
+    configFile,
+    plugins: [{name, writeBundle}],
+  });
+};
+
+/**
+ * Start or restart App when source files are changed
+ * @param {import('vite').ViteDevServer} viteDevServer
+ * @returns {Promise<import('vite').RollupOutput | Array<import('vite').RollupOutput> | import('vite').RollupWatcher>}
+ */
+const setupMainPackageWatcher = viteDevServer => {
+  // Write a value to an environment variable to pass it to the main process.
+  {
+    const protocol = `http${viteDevServer.config.server.https ? 's' : ''}:`;
+    const host = viteDevServer.config.server.host || 'localhost';
+    const port = viteDevServer.config.server.port; // Vite searches for and occupies the first free port: 3000, 3001, 3002 and so on
+    const path = '/';
+    process.env.VITE_DEV_SERVER_URL = `${protocol}//${host}:${port}${path}`;
+  }
+
+  const logger = createLogger(LOG_LEVEL, {
+    prefix: '[main]',
+  });
+
+  /** @type {ChildProcessWithoutNullStreams | null} */
+  let spawnProcess = null;
+
+  return getWatcher({
+    name: 'reload-app-on-main-package-change',
+    configFile: 'packages/main/vite.config.js',
+    writeBundle() {
+      if (spawnProcess !== null) {
+        spawnProcess.kill('SIGINT');
+        spawnProcess = null;
+      }
+
+      spawnProcess = spawn(String(electronPath), ['.']);
+
+      spawnProcess.stdout.on(
+        'data',
+        d => d.toString().trim() && logger.warn(d.toString(), {timestamp: true}),
+      );
+      spawnProcess.stderr.on(
+        'data',
+        d => d.toString().trim() && logger.error(d.toString(), {timestamp: true}),
+      );
+    },
+  });
+};
+
+/**
+ * Start or restart App when source files are changed
+ * @param {import('vite').ViteDevServer} viteDevServer
+ * @returns {Promise<import('vite').RollupOutput | Array<import('vite').RollupOutput> | import('vite').RollupWatcher>}
+ */
+const setupPreloadPackageWatcher = viteDevServer => {
+  return getWatcher({
+    name: 'reload-page-on-preload-package-change',
+    configFile: 'packages/preload/vite.config.js',
+    writeBundle() {
+      viteDevServer.ws.send({
+        type: 'full-reload',
+      });
+    },
+  });
+};
+
+(async () => {
+  try {
+    const viteDevServer = await createServer({
+      ...sharedConfig,
+      configFile: 'packages/renderer/vite.config.js',
+    });
+
+    await viteDevServer.listen();
+
+    await setupPreloadPackageWatcher(viteDevServer);
+    await setupMainPackageWatcher(viteDevServer);
+  } catch (e) {
+    console.error(e);
+    process.exit(1);
+  }
+})();
