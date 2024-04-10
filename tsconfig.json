@@ -1,0 +1,14 @@
+{
+  "compilerOptions": {
+    "module": "exnext",
+    "target": "exnext",
+    "sourceMap": true,
+    "moduleDetection": "Node",
+    "skipLibCheck": true,
+    "strict": true,
+    "isolatedModules": true,
+    "types": ["vite/client", "node"],
+    "typeRoots": ["node_modules/@types"],
+    "lib": ["ESNext"]
+  }
+}
